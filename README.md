@@ -100,7 +100,104 @@ public List<DetallesPlanillaEntity> buscarDetallesPlanillaPorRango(RequestDto dt
         OFFSET ? ROWS FETCH NEXT ? ROWS ONLY
     """;
 
+
+
+
+    
+
     return jdbcTemplate.query(sql,
             new Object[]{dto.getNoPlanilla(), offset, pageSize},
             new BeanPropertyRowMapper<>(DetallesPlanillaEntity.class));
+}
+@Repository
+public class DetallesPlanillaImplRepository implements IDetallesPlanillaRepository {
+
+    @PersistenceContext
+    private EntityManager entityManager;
+
+    private static final String QUERY_CONSULTA_DEPOSITO_PLANILLAS = """
+        SELECT * 
+        FROM RE.RE_DETALLES_PLANILLA RDP
+        WHERE RDP.NUM_PLANILLA = :NUM_PLANILLA
+          AND (:TIPO_IDENTIFICACION IS NULL OR RDP.TIPO_IDENTIFICACION = :TIPO_IDENTIFICACION)
+          AND (:NUMERO_IDENTIFICACION IS NULL OR RDP.NUMERO_IDENTIFICACION = :NUMERO_IDENTIFICACION)
+          AND (:ESTADO IS NULL OR RDP.ESTADO = :ESTADO)
+          AND (:NUP IS NULL OR RDP.NUP = :NUP)
+        ORDER BY %s
+        OFFSET :offset ROWS FETCH NEXT :limit ROWS ONLY
+    """;
+
+    // 🔹 Cache simple para homologaciones (en memoria)
+    private final Map<String, String> homologacionCache = new ConcurrentHashMap<>();
+
+    @Override
+    public List<DetallesPlanillaEntity> buscarDetallesPlanilla(RequestDto request) {
+
+        // 🔹 Parámetros de paginación (valores quemados si no se reciben)
+        int pageSize = 1000;
+        int currentPage = 0;
+
+        List<DetallesPlanillaEntity> allResults = new ArrayList<>();
+
+        while (true) {
+            String queryStr = String.format(QUERY_CONSULTA_DEPOSITO_PLANILLAS, getOrderBy(request));
+            Query query = entityManager.createNativeQuery(queryStr, DetallesPlanillaEntity.class);
+
+            query.setParameter("NUM_PLANILLA", request.getNumPlanilla());
+            query.setParameter("TIPO_IDENTIFICACION", request.getTipoIdentificacion());
+            query.setParameter("NUMERO_IDENTIFICACION", request.getNumeroIdentificacion());
+            query.setParameter("ESTADO", request.getEstadoPlanilla());
+            query.setParameter("NUP", request.getNoCuenta());
+            query.setParameter("offset", currentPage * pageSize);
+            query.setParameter("limit", pageSize);
+
+            List<DetallesPlanillaEntity> results = query.getResultList();
+            if (results.isEmpty()) break;
+
+            // 🔹 Procesar en paralelo con Virtual Threads
+            try (var executor = Executors.newVirtualThreadPerTaskExecutor()) {
+                List<CompletableFuture<DetallesPlanillaEntity>> futures = results.stream()
+                        .map(entity -> CompletableFuture.supplyAsync(() -> mapWithHomologacion(entity), executor))
+                        .toList();
+
+                List<DetallesPlanillaEntity> processed = futures.stream()
+                        .map(CompletableFuture::join)
+                        .toList();
+
+                allResults.addAll(processed);
+            }
+
+            // 🔹 Avanza de página
+            if (results.size() < pageSize) break;
+            currentPage++;
+        }
+
+        return allResults;
+    }
+
+    private String getOrderBy(RequestDto request) {
+        return switch (request.getOrderDesc()) {
+            case "SUMA_APORTES" -> "RDP.SUMA_APORTES";
+            case "ESTADO" -> "RDP.ESTADO";
+            case "PRIMER_APELLIDO" -> "RDP.PRIMER_APELLIDO";
+            default -> "RDP.PRIMER_APELLIDO";
+        };
+    }
+
+    /**
+     * 🔹 Aplica la homologación con cache para no repetir consultas.
+     */
+    private DetallesPlanillaEntity mapWithHomologacion(DetallesPlanillaEntity entity) {
+        String codigo = entity.getCodigoCampo();
+        String descripcion = homologacionCache.computeIfAbsent(codigo, this::consultarDescripcion);
+        entity.setDescripcionCampo(descripcion);
+        return entity;
+    }
+
+    private String consultarDescripcion(String codigo) {
+        // 🔹 Aquí haces la consulta real (o llamada a otro servicio)
+        Query q = entityManager.createNativeQuery("SELECT DESCRIPCION FROM TABLA_HOMOLOGACION WHERE CODIGO = :codigo");
+        q.setParameter("codigo", codigo);
+        return (String) q.getSingleResult();
+    }
 }
